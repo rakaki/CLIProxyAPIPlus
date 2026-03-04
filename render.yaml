@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: cliproxyapi
+    env: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    envVars:
+      - key: DEPLOY
+        value: cloud
+      - key: PORT
+        value: 10000
