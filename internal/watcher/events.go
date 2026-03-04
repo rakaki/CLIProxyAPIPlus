@@ -28,17 +28,27 @@ func matchProvider(provider string, targets []string) (string, bool) {
 }
 
 func (w *Watcher) start(ctx context.Context) error {
+	// Try to watch config file, but don't fail if it doesn't exist (cloud deploy mode)
 	if errAddConfig := w.watcher.Add(w.configPath); errAddConfig != nil {
-		log.Errorf("failed to watch config file %s: %v", w.configPath, errAddConfig)
-		return errAddConfig
+		// In cloud deploy mode, config file may not exist initially
+		// Try to watch the directory instead so we can detect when config is created
+		configDir := filepath.Dir(w.configPath)
+		if errAddDir := w.watcher.Add(configDir); errAddDir != nil {
+			log.Warnf("failed to watch config directory %s: %v", configDir, errAddDir)
+			// Don't fail completely, just skip config watching
+		} else {
+			log.Debugf("watching config directory: %s", configDir)
+		}
+	} else {
+		log.Debugf("watching config file: %s", w.configPath)
 	}
-	log.Debugf("watching config file: %s", w.configPath)
 
 	if errAddAuthDir := w.watcher.Add(w.authDir); errAddAuthDir != nil {
-		log.Errorf("failed to watch auth directory %s: %v", w.authDir, errAddAuthDir)
-		return errAddAuthDir
+		log.Warnf("failed to watch auth directory %s: %v", w.authDir, errAddAuthDir)
+		// Don't fail completely, auth watching is optional
+	} else {
+		log.Debugf("watching auth directory: %s", w.authDir)
 	}
-	log.Debugf("watching auth directory: %s", w.authDir)
 
 	w.watchKiroIDETokenFile()
 
