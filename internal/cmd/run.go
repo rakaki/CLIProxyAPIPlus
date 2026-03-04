@@ -6,7 +6,11 @@ package cmd
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -84,7 +88,8 @@ func StartServiceBackground(cfg *config.Config, configPath string, localPassword
 }
 
 // WaitForCloudDeploy waits indefinitely for shutdown signals in cloud deploy mode
-// when no configuration file is available.
+// when no configuration file is available. It starts a minimal HTTP server to satisfy
+// cloud platform health checks and port binding requirements.
 func WaitForCloudDeploy() {
 	// Clarify that we are intentionally idle for configuration and not running the API server.
 	log.Info("Cloud deploy mode: No config found; standing by for configuration. API server is not started. Press Ctrl+C to exit.")
@@ -92,7 +97,66 @@ func WaitForCloudDeploy() {
 	ctxSignal, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Start a minimal HTTP server for health checks and port binding
+	port := getCloudDeployPort()
+	server := startStandbyServer(port)
+
 	// Block until shutdown signal is received
 	<-ctxSignal.Done()
 	log.Info("Cloud deploy mode: Shutdown signal received; exiting")
+
+	// Gracefully shutdown the standby server
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Warnf("Cloud deploy mode: standby server shutdown error: %v", err)
+	}
+}
+
+// getCloudDeployPort returns the port to listen on in cloud deploy mode.
+// It reads from PORT environment variable (used by Render and other cloud platforms),
+// defaulting to 8080 if not set.
+func getCloudDeployPort() int {
+	if portStr := os.Getenv("PORT"); portStr != "" {
+		if port, err := strconv.Atoi(portStr); err == nil && port > 0 {
+			return port
+		}
+	}
+	return 8080 // Default port for cloud deploy standby mode
+}
+
+// startStandbyServer starts a minimal HTTP server that responds to health checks.
+// This is necessary for cloud platforms like Render that require an open port.
+func startStandbyServer(port int) *http.Server {
+	mux := http.NewServeMux()
+
+	// Health check endpoint - returns 200 OK with status message
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"status":"standby","message":"Waiting for configuration. Use Management API to upload config.yaml."}`)
+	})
+
+	// Also respond to /health for explicit health checks
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"status":"healthy","mode":"standby"}`)
+	})
+
+	server := &http.Server{
+		Addr:         fmt.Sprintf(":%d", port),
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+
+	go func() {
+		log.Infof("Cloud deploy mode: standby HTTP server listening on port %d", port)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Warnf("Cloud deploy mode: standby server error: %v", err)
+		}
+	}()
+
+	return server
 }
