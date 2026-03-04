@@ -7,10 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -89,7 +92,7 @@ func StartServiceBackground(cfg *config.Config, configPath string, localPassword
 
 // WaitForCloudDeploy waits indefinitely for shutdown signals in cloud deploy mode
 // when no configuration file is available. It starts a minimal HTTP server to satisfy
-// cloud platform health checks and port binding requirements.
+// cloud platform health checks and port binding requirements, and accepts config uploads.
 func WaitForCloudDeploy() {
 	// Clarify that we are intentionally idle for configuration and not running the API server.
 	log.Info("Cloud deploy mode: No config found; standing by for configuration. API server is not started. Press Ctrl+C to exit.")
@@ -97,7 +100,7 @@ func WaitForCloudDeploy() {
 	ctxSignal, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Start a minimal HTTP server for health checks and port binding
+	// Start a minimal HTTP server for health checks and config upload
 	port := getCloudDeployPort()
 	server := startStandbyServer(port)
 
@@ -125,10 +128,12 @@ func getCloudDeployPort() int {
 	return 8080 // Default port for cloud deploy standby mode
 }
 
-// startStandbyServer starts a minimal HTTP server that responds to health checks.
+// startStandbyServer starts a minimal HTTP server that responds to health checks
+// and accepts configuration uploads via Management API.
 // This is necessary for cloud platforms like Render that require an open port.
 func startStandbyServer(port int) *http.Server {
 	mux := http.NewServeMux()
+	managementPassword := os.Getenv("MANAGEMENT_PASSWORD")
 
 	// Health check endpoint - returns 200 OK with status message
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -144,11 +149,66 @@ func startStandbyServer(port int) *http.Server {
 		fmt.Fprintf(w, `{"status":"healthy","mode":"standby"}`)
 	})
 
+	// Management API: GET /v0/management/config.yaml - returns current config (empty in standby)
+	mux.HandleFunc("/v0/management/config.yaml", func(w http.ResponseWriter, r *http.Request) {
+		// Check authorization
+		if !authorizeManagement(r, managementPassword) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprintf(w, `{"error":"unauthorized","message":"Invalid or missing Authorization header"}`)
+			return
+		}
+
+		switch r.Method {
+		case http.MethodGet:
+			// Return empty config or current config if exists
+			w.Header().Set("Content-Type", "application/yaml")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "# Configuration file - upload your config.yaml\n")
+		case http.MethodPut:
+			// Read config content
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprintf(w, `{"error":"bad_request","message":"Failed to read request body"}`)
+				return
+			}
+
+			// Determine config file path
+			configPath := getConfigPath()
+
+			// Write config file
+			if err := os.WriteFile(configPath, body, 0600); err != nil {
+				log.Errorf("Cloud deploy mode: failed to write config file: %v", err)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprintf(w, `{"error":"internal_error","message":"Failed to write config file"}`)
+				return
+			}
+
+			log.Infof("Cloud deploy mode: configuration saved to %s, restarting service...", configPath)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `{"status":"success","message":"Configuration saved. Service will restart."}`)
+
+			// Exit the process - the cloud platform will restart it
+			go func() {
+				time.Sleep(500 * time.Millisecond)
+				os.Exit(0)
+			}()
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			fmt.Fprintf(w, `{"error":"method_not_allowed","message":"Use GET or PUT"}`)
+		}
+	})
+
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", port),
 		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
 	}
 
 	go func() {
@@ -159,4 +219,39 @@ func startStandbyServer(port int) *http.Server {
 	}()
 
 	return server
+}
+
+// authorizeManagement checks if the request has valid management authorization.
+func authorizeManagement(r *http.Request, managementPassword string) bool {
+	if managementPassword == "" {
+		return false
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		return false
+	}
+
+	// Check Bearer token
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		return token == managementPassword
+	}
+
+	return false
+}
+
+// getConfigPath returns the path where config.yaml should be saved.
+func getConfigPath() string {
+	// Check for explicit config path
+	if configPath := os.Getenv("CONFIG_PATH"); configPath != "" {
+		return configPath
+	}
+
+	// Default: working directory
+	wd, err := os.Getwd()
+	if err != nil {
+		return "config.yaml"
+	}
+	return filepath.Join(wd, "config.yaml")
 }
