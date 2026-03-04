@@ -9,3 +9,12 @@ services:
         value: cloud
       - key: MANAGEMENT_PASSWORD
         generateValue: true
+      # CONFIG_CONTENT: Paste your config.yaml content here (as a single line or multiline string)
+      # Example:
+      # - key: CONFIG_CONTENT
+      #   value: |
+      #     port: 8317
+      #     auth_dir: /root/.cli-proxy-api
+      #     keys:
+      #       - name: my-key
+      #         key: sk-xxx

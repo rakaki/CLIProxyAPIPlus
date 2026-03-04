@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -579,17 +580,47 @@ func LoadConfig(configFile string) (*Config, error) {
 // LoadConfigOptional reads YAML from configFile.
 // If optional is true and the file is missing, it returns an empty Config.
 // If optional is true and the file is empty or invalid, it returns an empty Config.
+// In cloud deploy mode (optional=true), it also checks CONFIG_CONTENT environment variable
+// as an alternative source for configuration (useful for platforms like Render where
+// file system is ephemeral).
+// In cloud deploy mode, if no config is found, it falls back to config.example.yaml.
 func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
-	// Read the entire configuration file into memory.
-	data, err := os.ReadFile(configFile)
-	if err != nil {
-		if optional {
-			if os.IsNotExist(err) || errors.Is(err, syscall.EISDIR) {
-				// Missing and optional: return empty config (cloud deploy standby).
-				return &Config{}, nil
+	var data []byte
+	var err error
+
+	// In cloud deploy mode, first check CONFIG_CONTENT environment variable
+	if optional {
+		if configContent := os.Getenv("CONFIG_CONTENT"); configContent != "" {
+			data = []byte(configContent)
+		}
+	}
+
+	// If no CONFIG_CONTENT, read from file
+	if len(data) == 0 {
+		data, err = os.ReadFile(configFile)
+		if err != nil {
+			if optional {
+				if os.IsNotExist(err) || errors.Is(err, syscall.EISDIR) {
+					// In cloud deploy mode, try to fall back to config.example.yaml
+					exampleConfigPath := findExampleConfig(configFile)
+					if exampleConfigPath != "" {
+						exampleData, exampleErr := os.ReadFile(exampleConfigPath)
+						if exampleErr == nil && len(exampleData) > 0 {
+							log.Infof("cloud deploy mode: using example config from %s", exampleConfigPath)
+							data = exampleData
+						}
+					}
+					if len(data) == 0 {
+						// Missing and optional: return empty config (cloud deploy standby).
+						return &Config{}, nil
+					}
+				} else {
+					return nil, fmt.Errorf("failed to read config file: %w", err)
+				}
+			} else {
+				return nil, fmt.Errorf("failed to read config file: %w", err)
 			}
 		}
-		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
 	// In cloud deploy mode (optional=true), if file is empty or contains only whitespace, return empty config.
@@ -722,6 +753,27 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+// findExampleConfig tries to find config.example.yaml in the same directory as configFile,
+// or in the current working directory.
+func findExampleConfig(configFile string) string {
+	// Try same directory as configFile
+	dir := filepath.Dir(configFile)
+	examplePath := filepath.Join(dir, "config.example.yaml")
+	if _, err := os.Stat(examplePath); err == nil {
+		return examplePath
+	}
+
+	// Try current working directory
+	if wd, err := os.Getwd(); err == nil {
+		examplePath = filepath.Join(wd, "config.example.yaml")
+		if _, err := os.Stat(examplePath); err == nil {
+			return examplePath
+		}
+	}
+
+	return ""
 }
 
 // SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.
