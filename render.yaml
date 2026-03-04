@@ -8,4 +8,4 @@ services:
       - key: DEPLOY
         value: cloud
       - key: PORT
-        value: 10000
+        value: 8317
