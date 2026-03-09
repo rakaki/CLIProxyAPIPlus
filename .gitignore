@@ -5,7 +5,8 @@ cliproxy
 
 
 # Configuration
-config.yaml
+# config.yaml (allow inclusion in Git)
+# config.yaml
 .env
 .mcp.json
 # Generated content
